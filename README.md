@@ -1,3 +1,5 @@
+_forked from https://github.com/soohyunc/evalvid-2.7_
+
 evalvid-2.7
 ===========
 
@@ -5,4 +7,10 @@ evalvid-2.7
 * Project homepage -
   [http://www2.tkn.tu-berlin.de/research/evalvid/](http://www2.tkn.tu-berlin.de/research/evalvid/)
 
+---
 
+How I built it:
+
+Install Visual Studio 2026<br>
+Install GPAC to `C:\Applications\GPAC`<br>
+Run `_build_mp4trace_test.cmd`
