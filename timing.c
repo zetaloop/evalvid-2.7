@@ -2,6 +2,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#if defined(_WIN32)
+  #include <intrin.h>
+#endif
+
 #include "timing.h"
 
 /* private */
@@ -15,7 +19,7 @@ INLINE u64 get_hpc()
 {
 #if defined(_WIN32)
   if (meas_) {
-    __asm { rdtsc }
+    return __rdtsc();
   } else {
     u64 c;
     QueryPerformanceCounter((LARGE_INTEGER *)&c);

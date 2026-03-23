@@ -13,9 +13,381 @@
 #include "timing.h"
 #include "queue.h"
 
+#define gf_isom_reset_hint_reader evalvid_gf_isom_reset_hint_reader
+#define gf_isom_next_hint_packet evalvid_gf_isom_next_hint_packet
+
 #define MP4_SSRC 6974316
 #define VQ_LEN 100
 #define AQ_LEN 10
+
+typedef struct hint_sample_cache_entry {
+  GF_ISOSample *sample;
+  u32 track_number;
+  u32 sample_number;
+} hint_sample_cache_entry_t;
+
+typedef struct hint_reader_state {
+  GF_ISOFile *file;
+  u32 track_number;
+  u32 hint_subtype;
+  u32 current_sample;
+  u32 packet_sequence;
+  u32 ts_offset;
+  u32 ssrc;
+  GF_HintSample *hint_sample;
+  struct hint_reader_state *next;
+} hint_reader_state_t;
+
+static hint_reader_state_t *hint_readers;
+
+static GF_HintSample *local_hint_sample_new(u32 hint_subtype)
+{
+  GF_HintSample *sample;
+
+  switch (hint_subtype) {
+    case GF_ISOM_BOX_TYPE_RTP_STSD:
+    case GF_ISOM_BOX_TYPE_SRTP_STSD:
+    case GF_ISOM_BOX_TYPE_RRTP_STSD:
+      break;
+    default:
+      return 0;
+  }
+
+  sample = calloc(1, sizeof *sample);
+  if (!sample) return 0;
+  sample->packetTable = gf_list_new();
+  if (!sample->packetTable) {
+    free(sample);
+    return 0;
+  }
+  sample->hint_subtype = hint_subtype;
+  return sample;
+}
+
+static void local_hint_sample_del(GF_HintSample *sample)
+{
+  if (!sample) return;
+
+  while (gf_list_count(sample->packetTable)) {
+    GF_HintPacket *packet = gf_list_get(sample->packetTable, 0);
+    gf_isom_hint_pck_del(packet);
+    gf_list_rem(sample->packetTable, 0);
+  }
+  gf_list_del(sample->packetTable);
+
+  if (sample->AdditionalData) free(sample->AdditionalData);
+
+  if (sample->sample_cache) {
+    while (gf_list_count(sample->sample_cache)) {
+      hint_sample_cache_entry_t *entry = gf_list_get(sample->sample_cache, 0);
+      gf_list_rem(sample->sample_cache, 0);
+      if (entry->sample) gf_isom_sample_del(&entry->sample);
+      free(entry);
+    }
+    gf_list_del(sample->sample_cache);
+  }
+
+  free(sample);
+}
+
+static GF_Err local_hint_sample_read(GF_HintSample *sample, GF_BitStream *bitstream, u32 sample_size)
+{
+  u16 i;
+
+  sample->packetCount = gf_bs_read_u16(bitstream);
+  sample->reserved = gf_bs_read_u16(bitstream);
+  if (sample->packetCount >= sample_size) return GF_ISOM_INVALID_MEDIA;
+
+  for (i = 0; i < sample->packetCount; i++) {
+    GF_HintPacket *packet;
+    GF_Err error;
+
+    if (!gf_bs_available(bitstream)) return GF_ISOM_INVALID_MEDIA;
+
+    packet = gf_isom_hint_pck_new(sample->hint_subtype);
+    if (!packet) return GF_OUT_OF_MEM;
+    packet->trackID = sample->trackID;
+    packet->sampleNumber = sample->sampleNumber;
+    gf_list_add(sample->packetTable, packet);
+
+    error = gf_isom_hint_pck_read(packet, bitstream);
+    if (error) return error;
+  }
+
+  return GF_OK;
+}
+
+static hint_reader_state_t *find_hint_reader(GF_ISOFile *file, u32 track_number)
+{
+  hint_reader_state_t *state = hint_readers;
+
+  while (state) {
+    if (state->file == file && state->track_number == track_number) return state;
+    state = state->next;
+  }
+  return 0;
+}
+
+static void release_hint_reader(hint_reader_state_t *state)
+{
+  hint_reader_state_t **current = &hint_readers;
+
+  while (*current) {
+    if (*current == state) {
+      *current = state->next;
+      local_hint_sample_del(state->hint_sample);
+      free(state);
+      return;
+    }
+    current = &(*current)->next;
+  }
+}
+
+static void release_hint_readers_for_file(GF_ISOFile *file)
+{
+  hint_reader_state_t *state = hint_readers;
+  hint_reader_state_t *next;
+
+  while (state) {
+    next = state->next;
+    if (state->file == file) release_hint_reader(state);
+    state = next;
+  }
+}
+
+static hint_sample_cache_entry_t *find_cached_sample(GF_HintSample *hint_sample, u32 track_number, u32 sample_number)
+{
+  u32 count = gf_list_count(hint_sample->sample_cache);
+  u32 i;
+
+  for (i = 0; i < count; i++) {
+    hint_sample_cache_entry_t *entry = gf_list_get(hint_sample->sample_cache, i);
+    if (entry->track_number == track_number && entry->sample_number == sample_number) return entry;
+  }
+  return 0;
+}
+
+static GF_ISOSample *get_cached_sample(GF_HintSample *hint_sample, GF_ISOFile *file, u32 track_number, u32 sample_number)
+{
+  hint_sample_cache_entry_t *entry = find_cached_sample(hint_sample, track_number, sample_number);
+  u32 description_index = 0;
+
+  if (entry) return entry->sample;
+
+  entry = calloc(1, sizeof *entry);
+  if (!entry) return 0;
+
+  entry->sample = gf_isom_get_sample(file, track_number, sample_number, &description_index);
+  if (!entry->sample) {
+    free(entry);
+    return 0;
+  }
+
+  entry->track_number = track_number;
+  entry->sample_number = sample_number;
+  gf_list_add(hint_sample->sample_cache, entry);
+  return entry->sample;
+}
+
+static GF_Err load_next_hint_sample(hint_reader_state_t *state)
+{
+  GF_ISOSample *sample;
+  GF_BitStream *bitstream;
+  GF_Err error;
+  u32 description_index = 0;
+  u32 sample_count = gf_isom_get_sample_count(state->file, state->track_number);
+
+  if (!state->current_sample || state->current_sample > sample_count) return GF_EOS;
+
+  sample = gf_isom_get_sample(state->file, state->track_number, state->current_sample, &description_index);
+  if (!sample) return GF_IO_ERR;
+  state->current_sample++;
+
+  local_hint_sample_del(state->hint_sample);
+  state->hint_sample = local_hint_sample_new(state->hint_subtype);
+  if (!state->hint_sample) {
+    gf_isom_sample_del(&sample);
+    return GF_OUT_OF_MEM;
+  }
+
+  state->hint_sample->trackID = state->track_number;
+  state->hint_sample->sampleNumber = state->current_sample - 1;
+  bitstream = gf_bs_new(sample->data, sample->dataLength, GF_BITSTREAM_READ);
+  if (!bitstream) {
+    gf_isom_sample_del(&sample);
+    return GF_OUT_OF_MEM;
+  }
+
+  error = local_hint_sample_read(state->hint_sample, bitstream, sample->dataLength);
+  gf_bs_del(bitstream);
+  if (error) {
+    gf_isom_sample_del(&sample);
+    return error;
+  }
+
+  state->hint_sample->TransmissionTime = sample->DTS;
+  state->hint_sample->sample_cache = gf_list_new();
+  gf_isom_sample_del(&sample);
+  return state->hint_sample->sample_cache ? GF_OK : GF_OUT_OF_MEM;
+}
+
+static GF_Err evalvid_gf_isom_reset_hint_reader(GF_ISOFile *file, u32 track_number, u32 sample_start, u32 ts_offset, u32 sn_offset, u32 ssrc)
+{
+  hint_reader_state_t *state = find_hint_reader(file, track_number);
+  u32 hint_subtype;
+  u32 sample_count;
+
+  if (!sample_start) return GF_BAD_PARAM;
+  sample_count = gf_isom_get_sample_count(file, track_number);
+  if (!sample_count || sample_start > sample_count) return GF_BAD_PARAM;
+
+  hint_subtype = gf_isom_get_mpeg4_subtype(file, track_number, 1);
+  if (!hint_subtype) hint_subtype = gf_isom_get_media_subtype(file, track_number, 1);
+
+  switch (hint_subtype) {
+    case GF_ISOM_BOX_TYPE_RTP_STSD:
+    case GF_ISOM_BOX_TYPE_SRTP_STSD:
+    case GF_ISOM_BOX_TYPE_RRTP_STSD:
+      break;
+    default:
+      return GF_NOT_SUPPORTED;
+  }
+
+  if (!state) {
+    state = calloc(1, sizeof *state);
+    if (!state) return GF_OUT_OF_MEM;
+    state->file = file;
+    state->track_number = track_number;
+    state->next = hint_readers;
+    hint_readers = state;
+  }
+
+  local_hint_sample_del(state->hint_sample);
+  state->hint_sample = 0;
+  state->hint_subtype = hint_subtype;
+  state->current_sample = sample_start;
+  state->packet_sequence = 1 + sn_offset;
+  state->ts_offset = ts_offset;
+  state->ssrc = ssrc;
+  return GF_OK;
+}
+
+static GF_Err evalvid_gf_isom_next_hint_packet(GF_ISOFile *file, u32 track_number, char **packet_data, u32 *packet_size, Bool *disposable, Bool *repeated, u32 *trans_ts, u32 *sample_num)
+{
+  GF_HintPacket *packet;
+  GF_RTPPacket *rtp_packet;
+  GF_BitStream *bitstream;
+  hint_reader_state_t *state = find_hint_reader(file, track_number);
+  GF_Err error;
+  u32 count;
+  u32 i;
+  s32 cts_offset = 0;
+  u32 timestamp;
+
+  if (packet_data) *packet_data = 0;
+  if (packet_size) *packet_size = 0;
+  if (trans_ts) *trans_ts = 0;
+  if (disposable) *disposable = 0;
+  if (repeated) *repeated = 0;
+  if (sample_num) *sample_num = 0;
+
+  if (!state || !packet_data || !packet_size) return GF_BAD_PARAM;
+
+  if (!state->hint_sample) {
+    error = load_next_hint_sample(state);
+    if (error) return error;
+  }
+
+  packet = gf_list_get(state->hint_sample->packetTable, 0);
+  gf_list_rem(state->hint_sample->packetTable, 0);
+  if (!packet) return GF_BAD_PARAM;
+
+  rtp_packet = (GF_RTPPacket *)packet;
+  count = gf_list_count(rtp_packet->TLV);
+  for (i = 0; i < count; i++) {
+    GF_RTPOBox *rtpo = gf_list_get(rtp_packet->TLV, i);
+    if (((GF_Box *)rtpo)->type == GF_ISOM_BOX_TYPE_RTPO) {
+      cts_offset = rtpo->timeOffset;
+      break;
+    }
+  }
+
+  bitstream = gf_bs_new(NULL, 0, GF_BITSTREAM_WRITE);
+  if (!bitstream) {
+    gf_isom_hint_pck_del(packet);
+    return GF_OUT_OF_MEM;
+  }
+
+  gf_bs_write_int(bitstream, 2, 2);
+  gf_bs_write_int(bitstream, rtp_packet->P_bit, 1);
+  gf_bs_write_int(bitstream, rtp_packet->X_bit, 1);
+  gf_bs_write_int(bitstream, 0, 4);
+  gf_bs_write_int(bitstream, rtp_packet->M_bit, 1);
+  gf_bs_write_int(bitstream, rtp_packet->payloadType, 7);
+  gf_bs_write_u16(bitstream, state->packet_sequence++);
+
+  timestamp = (u32)(state->hint_sample->TransmissionTime + rtp_packet->relativeTransTime + state->ts_offset + cts_offset);
+  gf_bs_write_u32(bitstream, timestamp);
+  gf_bs_write_u32(bitstream, state->ssrc);
+
+  count = gf_list_count(rtp_packet->DataTable);
+  for (i = 0; i < count; i++) {
+    GF_GenericDTE *dte = gf_list_get(rtp_packet->DataTable, i);
+
+    switch (dte->source) {
+      case 0:
+        break;
+      case 1:
+      {
+        GF_ImmediateDTE *immediate = (GF_ImmediateDTE *)dte;
+        gf_bs_write_data(bitstream, immediate->data, immediate->dataLength);
+        break;
+      }
+      case 2:
+      {
+        GF_SampleDTE *sample_dte = (GF_SampleDTE *)dte;
+        GF_ISOSample *sample;
+        u32 data_track = track_number;
+
+        if (sample_dte->trackRefIndex != (s8)-1) {
+          if (GF_OK != gf_isom_get_reference(file, track_number, GF_ISOM_REF_HINT, (u32)sample_dte->trackRefIndex + 1, &data_track)) {
+            gf_bs_del(bitstream);
+            gf_isom_hint_pck_del(packet);
+            return GF_ISOM_INVALID_FILE;
+          }
+        }
+
+        sample = get_cached_sample(state->hint_sample, file, data_track, sample_dte->sampleNumber);
+        if (!sample) {
+          gf_bs_del(bitstream);
+          gf_isom_hint_pck_del(packet);
+          return GF_IO_ERR;
+        }
+
+        gf_bs_write_data(bitstream, sample->data + sample_dte->byteOffset, sample_dte->dataLength);
+        break;
+      }
+      case 3:
+        break;
+    }
+  }
+
+  if (trans_ts) *trans_ts = timestamp;
+  if (disposable) *disposable = rtp_packet->B_bit;
+  if (repeated) *repeated = rtp_packet->R_bit;
+  if (sample_num) *sample_num = state->current_sample - 1;
+
+  gf_bs_get_content(bitstream, packet_data, packet_size);
+  gf_bs_del(bitstream);
+  gf_isom_hint_pck_del(packet);
+
+  if (!gf_list_count(state->hint_sample->packetTable)) {
+    local_hint_sample_del(state->hint_sample);
+    state->hint_sample = 0;
+  }
+
+  return GF_OK;
+}
 
 static char *form_dur(u64 dur, u32 scale)
 {
@@ -390,7 +762,10 @@ U:  puts("Usage: mp4trace [options] file");
     return EXIT_FAILURE;
   }
 
-  if (fv) gf_isom_close(fv);
+  if (fv) {
+    release_hint_readers_for_file(fv);
+    gf_isom_close(fv);
+  }
 
   for (j = 0; j < loop; j++) {
     if (0 == (fv = gf_isom_open(cl[n], GF_ISOM_OPEN_READ, 0))) {
@@ -547,8 +922,14 @@ U:  puts("Usage: mp4trace [options] file");
     last_video_ts += video_ts;
     last_audio_ts += audio_ts;
 
-    if (fv) gf_isom_close(fv);
-    if (fa) gf_isom_close(fa);
+    if (fv) {
+      release_hint_readers_for_file(fv);
+      gf_isom_close(fv);
+    }
+    if (fa) {
+      release_hint_readers_for_file(fa);
+      gf_isom_close(fa);
+    }
   }
 
   return 0;
