@@ -13,4 +13,4 @@ How I built it:
 
 Install Visual Studio 2026<br>
 Install GPAC to `C:\Applications\GPAC`<br>
-Run `build_mp4trace.cmd`
+Run `build_all_binaries.cmd`

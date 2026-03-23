@@ -10,6 +10,75 @@
 #include "misc.h"
 #include "writemp4.h"
 
+#define gf_isom_hint_sample_new evalvid_gf_isom_hint_sample_new
+#define gf_isom_hint_sample_read evalvid_gf_isom_hint_sample_read
+#define gf_isom_hint_sample_del evalvid_gf_isom_hint_sample_del
+
+static GF_HintSample *evalvid_gf_isom_hint_sample_new(u32 hint_subtype)
+{
+  GF_HintSample *sample;
+
+  switch (hint_subtype) {
+    case GF_ISOM_BOX_TYPE_RTP_STSD:
+    case GF_ISOM_BOX_TYPE_SRTP_STSD:
+    case GF_ISOM_BOX_TYPE_RRTP_STSD:
+      break;
+    default:
+      return 0;
+  }
+
+  sample = calloc(1, sizeof *sample);
+  if (!sample) return 0;
+  sample->packetTable = gf_list_new();
+  if (!sample->packetTable) {
+    free(sample);
+    return 0;
+  }
+  sample->hint_subtype = hint_subtype;
+  return sample;
+}
+
+static void evalvid_gf_isom_hint_sample_del(GF_HintSample *sample)
+{
+  if (!sample) return;
+
+  while (gf_list_count(sample->packetTable)) {
+    GF_HintPacket *packet = gf_list_get(sample->packetTable, 0);
+    gf_isom_hint_pck_del(packet);
+    gf_list_rem(sample->packetTable, 0);
+  }
+  gf_list_del(sample->packetTable);
+  if (sample->AdditionalData) free(sample->AdditionalData);
+  free(sample);
+}
+
+static GF_Err evalvid_gf_isom_hint_sample_read(GF_HintSample *sample, GF_BitStream *bitstream, u32 sample_size)
+{
+  u16 i;
+
+  sample->packetCount = gf_bs_read_u16(bitstream);
+  sample->reserved = gf_bs_read_u16(bitstream);
+  if (sample->packetCount >= sample_size) return GF_ISOM_INVALID_MEDIA;
+
+  for (i = 0; i < sample->packetCount; i++) {
+    GF_HintPacket *packet;
+    GF_Err error;
+
+    if (!gf_bs_available(bitstream)) return GF_ISOM_INVALID_MEDIA;
+
+    packet = gf_isom_hint_pck_new(sample->hint_subtype);
+    if (!packet) return GF_OUT_OF_MEM;
+    packet->trackID = sample->trackID;
+    packet->sampleNumber = sample->sampleNumber;
+    gf_list_add(sample->packetTable, packet);
+
+    error = gf_isom_hint_pck_read(packet, bitstream);
+    if (error) return error;
+  }
+
+  return GF_OK;
+}
+
 static void write_sample(GF_ISOSample *smp, GF_AVCConfig *avccfg, GF_M4ADecSpecInfo *acfg, u32 is_aac, u32 aac_type, GF_BitStream *bs)
 {
   if (!avccfg) {
@@ -185,6 +254,7 @@ static int write_raw(GF_ISOFile *fi, u32 hint, u32 data, char *fn, data_t *D, MO
             }
           }
         }
+        gf_isom_hint_sample_del(hint_smp);
       }
     }
     else if (mode & FRAME || mode & COMPLETE) {
@@ -232,6 +302,7 @@ static int write_raw(GF_ISOFile *fi, u32 hint, u32 data, char *fn, data_t *D, MO
           }
         }
       }
+      gf_isom_hint_sample_del(hint_smp);
     }
   }
   if (tmp) write_sample(tmp, avccfg, &acfg, is_aac, aac_type, bs);
@@ -321,6 +392,7 @@ static int write_mp4(GF_ISOFile *fi, u32 hint, u32 data, char *fn, data_t *D, MO
             }
           }
         }
+        gf_isom_hint_sample_del(hint_smp);
       }
     }
     else if (mode & FRAME || mode & COMPLETE) {
@@ -368,6 +440,7 @@ static int write_mp4(GF_ISOFile *fi, u32 hint, u32 data, char *fn, data_t *D, MO
           }
         }
       }
+      gf_isom_hint_sample_del(hint_smp);
     }
     if (esd) {
       rate += smp->dataLength;
